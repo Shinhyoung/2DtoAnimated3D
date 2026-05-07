@@ -1,0 +1,29 @@
+{
+  "description": "BVH source bone -> FBX target bone mapping. Both use Mixamo names so this is currently an identity map; replace target values to retarget non-Mixamo BVH (e.g., CMU mocap).",
+  "root_bone": "Hips",
+  "copy_root_translation": true,
+  "mapping": {
+    "Hips":          "Hips",
+    "Spine":         "Spine",
+    "Spine1":        "Spine1",
+    "Spine2":        "Spine2",
+    "Neck":          "Neck",
+    "Head":          "Head",
+    "LeftShoulder":  "LeftShoulder",
+    "LeftArm":       "LeftArm",
+    "LeftForeArm":   "LeftForeArm",
+    "LeftHand":      "LeftHand",
+    "RightShoulder": "RightShoulder",
+    "RightArm":      "RightArm",
+    "RightForeArm":  "RightForeArm",
+    "RightHand":     "RightHand",
+    "LeftUpLeg":     "LeftUpLeg",
+    "LeftLeg":       "LeftLeg",
+    "LeftFoot":      "LeftFoot",
+    "LeftToeBase":   "LeftToeBase",
+    "RightUpLeg":    "RightUpLeg",
+    "RightLeg":      "RightLeg",
+    "RightFoot":     "RightFoot",
+    "RightToeBase":  "RightToeBase"
+  }
+}

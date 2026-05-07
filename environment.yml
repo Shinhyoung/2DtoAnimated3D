@@ -1,0 +1,43 @@
+name: img2mesh
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26.*
+  - scipy
+  - pillow
+  - tqdm
+  - pip:
+      # PyTorch: cu128 wheels required for RTX 5070 (Blackwell, sm_120).
+      # Conda's pytorch-cuda lags Blackwell support, so install via pip.
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.11.0+cu128
+      - torchvision==0.26.0+cu128
+
+      # Background removal
+      - rembg[gpu]==2.0.59
+      - onnxruntime-gpu==1.18.1
+      - opencv-python
+
+      # TripoSR runtime deps. transformers must stay on 4.x:
+      # 5.x uses a torch.library.custom_op schema that older torch versions reject.
+      # huggingface-hub upper bound is also constrained by gradio (>=0.33.5,<1.0).
+      - transformers==4.46.3
+      - tokenizers<0.21
+      - "huggingface-hub>=0.33.5,<1.0"
+      - trimesh>=4.0.5
+      - omegaconf>=2.3.0
+      - einops>=0.7.0
+      - imageio[ffmpeg]
+      - xatlas>=0.0.9
+      - moderngl>=5.10.0
+      - rich>=13.7.0
+
+      # Marching cubes (CPU). torchmcubes (CUDA) needs CUDA-VS integration
+      # which often fails on Windows; PyMCubes is the portable fallback.
+      - PyMCubes>=0.1.4
+
+      # Web UI
+      - "gradio>=4.0,<7.0"

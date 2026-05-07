@@ -1,0 +1,46 @@
+# Generated outputs
+output/
+*.fbx
+*.glb
+!motions/*.bvh
+!skeleton_config.json
+!retarget_config.json
+
+# Sample artifacts at repo root (verify_*.fbx, dummy.fbx etc.)
+verify_*
+dummy.*
+
+# External dependency (cloned by install_3d_model.sh)
+TripoSR/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Pipeline state
+.checkpoint*
+.checkpoint*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
