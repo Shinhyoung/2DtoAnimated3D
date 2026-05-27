@@ -5,6 +5,7 @@ import math
 import sys
 from pathlib import Path
 
+import bmesh
 import bpy
 import mathutils
 
@@ -20,6 +21,12 @@ def _parse_args():
     p.add_argument("--output", required=True)
     p.add_argument("--config", required=True)
     p.add_argument("--skeleton-type", default="mixamo")
+    p.add_argument("--voxel-size", type=float, default=0.0065,
+                   help="Voxel remesh edge size in mesh units. Smaller preserves "
+                        "narrow gaps (e.g. armpit) but increases poly count.")
+    p.add_argument("--skip-voxel-remesh", action="store_true",
+                   help="Skip the voxel remesh + bake-from-original step entirely "
+                        "(use original mesh topology as-is, even when UV-textured).")
     return p.parse_args(argv)
 
 
@@ -127,12 +134,218 @@ def _build_armature(config, bmin, bmax):
     return arm_obj
 
 
+def _has_uv_textured_material(mesh_obj) -> bool:
+    """Detect TRELLIS-style mesh: UV map + material with image texture, no vertex colors."""
+    if not mesh_obj.data.uv_layers:
+        return False
+    if mesh_obj.data.color_attributes:
+        return False  # TripoSR-style — handled by vertex-color bake path
+    for mat in mesh_obj.data.materials:
+        if mat is None or not mat.use_nodes:
+            continue
+        for n in mat.node_tree.nodes:
+            if n.type == "TEX_IMAGE" and n.image is not None:
+                return True
+    return False
+
+
+def _voxel_remesh_and_rebake(mesh_obj, image_path, voxel_size=0.008, image_size=2048):
+    """For TRELLIS-style meshes: keep a hidden copy of the original (with UV
+    + texture), voxel-remesh the working mesh into a clean watertight
+    manifold (which loses the UV map), unwrap the remesh, and bake the
+    original's diffuse pass onto the new UV via selected-to-active baking."""
+    ref = mesh_obj.copy()
+    ref.data = mesh_obj.data.copy()
+    ref.name = mesh_obj.name + "_ref"
+    bpy.context.collection.objects.link(ref)
+    n0 = len(mesh_obj.data.vertices)
+
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+    mod = mesh_obj.modifiers.new(name="VoxelRemesh", type="REMESH")
+    mod.mode = "VOXEL"
+    mod.voxel_size = voxel_size
+    mod.adaptivity = 0.0
+    mod.use_smooth_shade = True
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+    n1 = len(mesh_obj.data.vertices)
+    print(f"[rig] voxel remesh: {n0} -> {n1} verts (voxel_size={voxel_size})")
+
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.uv.smart_project(angle_limit=1.15192, island_margin=0.01)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    img = bpy.data.images.new(f"{mesh_obj.name}_baked",
+                              width=image_size, height=image_size, alpha=False)
+
+    new_mat = bpy.data.materials.new(name="VoxelBakeMat")
+    if mesh_obj.data.materials:
+        mesh_obj.data.materials[0] = new_mat
+    else:
+        mesh_obj.data.materials.append(new_mat)
+    new_mat.use_nodes = True
+    nodes = new_mat.node_tree.nodes
+    links = new_mat.node_tree.links
+    nodes.clear()
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (0, 0)
+    bsdf.inputs["Roughness"].default_value = 0.9
+    output = nodes.new("ShaderNodeOutputMaterial"); output.location = (300, 0)
+    tex_node = nodes.new("ShaderNodeTexImage"); tex_node.image = img
+    tex_node.location = (-300, 0)
+    links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+    nodes.active = tex_node
+
+    scene = bpy.context.scene
+    prev_engine = scene.render.engine
+    scene.render.engine = "CYCLES"
+    try:
+        scene.cycles.device = "GPU"
+    except Exception:
+        pass
+    scene.cycles.samples = 1
+    scene.render.bake.use_pass_direct = False
+    scene.render.bake.use_pass_indirect = False
+    scene.render.bake.use_pass_color = True
+    scene.render.bake.use_selected_to_active = True
+    scene.render.bake.cage_extrusion = max(0.01, voxel_size * 2)
+    scene.render.bake.margin = 8
+
+    bpy.ops.object.select_all(action="DESELECT")
+    ref.select_set(True)            # source (selected, not active)
+    mesh_obj.select_set(True)       # target (active)
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.object.bake(type="DIFFUSE")
+
+    links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+    img.filepath_raw = str(image_path)
+    img.file_format = "PNG"
+    img.save()
+    print(f"[rig] baked original texture onto remeshed UV -> {image_path}")
+
+    bpy.data.objects.remove(ref, do_unlink=True)
+    scene.render.engine = prev_engine
+    return str(image_path)
+
+
+def _recalc_normals_outward(mesh_obj):
+    """Final cleanup pass: recalculate outward normals (helps TripoSR meshes;
+    voxel-remeshed meshes already have clean outward normals) and enable
+    backface culling on materials so the GLB preview path renders correctly."""
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    for mat in mesh_obj.data.materials:
+        if mat is not None:
+            mat.use_backface_culling = True
+
+
+def _strip_inward_polys(mesh_obj):
+    """Centroid heuristic: remove polygons whose normal points back toward the
+    mesh centroid. Cleans up TRELLIS double-shell artifacts when voxel remesh
+    is skipped — handles the easy 'pure inverted shell' case while leaving
+    concave regions (armpit, between fingers) alone."""
+    me = mesh_obj.data
+    if not (me.vertices and me.polygons):
+        return
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table(); bm.faces.ensure_lookup_table()
+    centroid = mathutils.Vector((0.0, 0.0, 0.0))
+    for v in bm.verts:
+        centroid += v.co
+    centroid /= len(bm.verts)
+    inward = []
+    n_total = len(bm.faces)
+    for f in bm.faces:
+        fc = mathutils.Vector((0.0, 0.0, 0.0))
+        for v in f.verts:
+            fc += v.co
+        fc /= len(f.verts)
+        outward_dir = fc - centroid
+        if outward_dir.length_squared < 1e-12:
+            continue
+        if f.normal.dot(outward_dir.normalized()) < -0.05:
+            inward.append(f)
+    if 0 < len(inward) < n_total:
+        bmesh.ops.delete(bm, geom=inward, context="FACES")
+        bm.to_mesh(me)
+        print(f"[rig] stripped {len(inward)}/{n_total} inward-facing polys (skip-remesh cleanup)")
+    else:
+        print(f"[rig] inward-facing polys: {len(inward)}/{n_total} — no strip")
+    bm.free()
+    me.update()
+
+
+def _maybe_decimate(mesh_obj, max_verts=50000):
+    """Bone-Heat auto-weighting fails on dense meshes (TRELLIS ~200k verts);
+    decimate down to a level the heat algorithm can solve. Lower poly is
+    actually preferred for skinned animation anyway."""
+    n = len(mesh_obj.data.vertices)
+    if n <= max_verts:
+        return n
+    ratio = max_verts / n
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+    mod = mesh_obj.modifiers.new(name="DecimateForRig", type="DECIMATE")
+    mod.ratio = ratio
+    mod.use_collapse_triangulate = True
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+    new_n = len(mesh_obj.data.vertices)
+    print(f"[rig] decimated for rigging: {n} -> {new_n} verts (ratio {ratio:.3f})")
+    return new_n
+
+
+def _has_meaningful_weights(mesh_obj):
+    """True if any vertex has a non-zero weight in any vertex group."""
+    for v in mesh_obj.data.vertices:
+        for g in v.groups:
+            if g.weight > 0.001:
+                return True
+    return False
+
+
 def _parent_with_auto_weights(mesh_obj, arm_obj):
     bpy.ops.object.select_all(action="DESELECT")
     mesh_obj.select_set(True)
     arm_obj.select_set(True)
     bpy.context.view_layer.objects.active = arm_obj
     bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+    print(f"[rig] AUTO weights: {len(mesh_obj.vertex_groups)} groups, "
+          f"meaningful={_has_meaningful_weights(mesh_obj)}")
+    if _has_meaningful_weights(mesh_obj):
+        return
+
+    # Heat weighting failed silently (common on TRELLIS / non-manifold meshes).
+    # Drop the empty groups, expand bone envelope coverage, and use envelope
+    # weights instead so the FBX exporter has real numbers to write.
+    print("[rig] heat weighting produced empty weights — falling back to ENVELOPE")
+    for vg in list(mesh_obj.vertex_groups):
+        mesh_obj.vertex_groups.remove(vg)
+    for b in arm_obj.data.bones:
+        blen = (b.tail_local - b.head_local).length
+        b.head_radius = max(b.head_radius, blen * 0.4)
+        b.tail_radius = max(b.tail_radius, blen * 0.4)
+        b.envelope_distance = max(b.envelope_distance, blen * 0.6)
+
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.object.parent_clear(type="CLEAR_KEEP_TRANSFORM")
+
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    arm_obj.select_set(True)
+    bpy.context.view_layer.objects.active = arm_obj
+    bpy.ops.object.parent_set(type="ARMATURE_ENVELOPE")
+    print(f"[rig] ENVELOPE weights: {len(mesh_obj.vertex_groups)} groups, "
+          f"meaningful={_has_meaningful_weights(mesh_obj)}")
 
 
 def _bake_vertex_colors_to_texture(mesh_obj, image_path, image_size=1024):
@@ -245,18 +458,36 @@ def main():
 
     _clear_scene()
     mesh_obj = _import_mesh(mesh_path)
-    # Mesh is expected to arrive Z-up (generate_mesh.py applies the +90°-around-Z
-    # correction). _orient_upright remains as a safety net for non-TripoSR meshes
-    # but is intentionally not called by default.
+    # Mesh is expected to arrive Z-up (generate_mesh.py applies the rotation
+    # for TripoSR; user-supplied GLB/OBJ should already be Z-up).
+    is_uv_textured = _has_uv_textured_material(mesh_obj)
+
+    if is_uv_textured and not args.skip_voxel_remesh:
+        # TRELLIS-style: voxel-remesh to a clean watertight manifold and bake
+        # the original textures onto the new UVs (avoids the inside-visible
+        # double-shell problem and keeps texture quality).
+        texture_path = out_path.parent / f"{out_path.stem}_color.png"
+        _voxel_remesh_and_rebake(mesh_obj, texture_path, voxel_size=args.voxel_size)
+    else:
+        # TripoSR-style or skip-remesh mode: decimate if huge, no remesh.
+        if args.skip_voxel_remesh and is_uv_textured:
+            print("[rig] --skip-voxel-remesh: keeping original topology")
+            # Mitigate inside-visible by stripping clearly-inward polys + recalc.
+            _strip_inward_polys(mesh_obj)
+        _maybe_decimate(mesh_obj, max_verts=50000)
+
     bmin, bmax = _world_bbox(mesh_obj)
     print(f"[rig] mesh bbox: min={bmin} max={bmax}")
 
     arm_obj = _build_armature(config, bmin, bmax)
     _parent_with_auto_weights(mesh_obj, arm_obj)
 
-    texture_path = out_path.parent / f"{out_path.stem}_color.png"
-    _bake_vertex_colors_to_texture(mesh_obj, texture_path)
+    if not is_uv_textured:
+        # Vertex-color path (TripoSR): bake VC to a PNG texture.
+        texture_path = out_path.parent / f"{out_path.stem}_color.png"
+        _bake_vertex_colors_to_texture(mesh_obj, texture_path)
 
+    _recalc_normals_outward(mesh_obj)
     _export_fbx(out_path, mesh_obj, arm_obj)
     print(f"[rig] exported: {out_path}")
 

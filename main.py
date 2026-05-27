@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from remove_bg import remove_background
-from generate_mesh import generate_mesh
+from generate_mesh import generate_mesh, VALID_BACKENDS, VALID_TEXTURERS
 from auto_rig import auto_rig
 from apply_motion import apply_motion
 
@@ -98,11 +98,13 @@ def load_cp(input_path):
         return {}
 
 
-def save_cp(input_path, completed):
+def save_cp(input_path, completed, backend=None):
     p = cp_path(input_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"input": str(input_path), "stages": sorted(completed)},
-                            indent=2), encoding="utf-8")
+    payload = {"input": str(input_path), "stages": sorted(completed)}
+    if backend is not None:
+        payload["backend"] = backend
+    p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def clear_cp(input_path):
@@ -158,7 +160,17 @@ def run_pipeline(args, image_path, output_path, motion_path, logger):
     output_path = Path(output_path)
     stem = Path(image_path).stem
 
-    completed = set(load_cp(image_path).get("stages", [])) if args.resume else set()
+    cp = load_cp(image_path) if args.resume else {}
+    completed = set(cp.get("stages", []))
+    # If the user switches backends between runs, the cached mesh is from the
+    # other model and must be re-generated. Downstream stages (rig, motion)
+    # consume the mesh so they must also redo.
+    cached_backend = cp.get("backend")
+    if completed and cached_backend and cached_backend != args.backend:
+        for s in ("mesh", "rig", "motion"):
+            completed.discard(s)
+        logger.info(f"Resume: backend changed ({cached_backend} -> {args.backend}); "
+                    "invalidating mesh/rig/motion stages.")
 
     # Determine stages
     stages = []
@@ -186,17 +198,20 @@ def run_pipeline(args, image_path, output_path, motion_path, logger):
         else:
             nobg = run_stage(idx, total, "배경 제거",
                 lambda: remove_background(image_path, OUTPUT_BASE / "nobg"), logger)
-            completed.add("bg"); save_cp(image_path, completed)
+            completed.add("bg"); save_cp(image_path, completed, backend=args.backend)
 
     if "mesh" in stages:
         idx += 1
         out = OUTPUT_BASE / "mesh" / f"{stem}.{args.format}"
+        mesh_label = f"메시 생성 ({args.backend})"
         if "mesh" in completed and out.is_file():
-            skip_stage(idx, total, "메시 생성", logger); mesh = str(out)
+            skip_stage(idx, total, mesh_label, logger); mesh = str(out)
         else:
-            mesh = run_stage(idx, total, "메시 생성",
-                lambda: generate_mesh(nobg, OUTPUT_BASE / "mesh", format=args.format), logger)
-            completed.add("mesh"); save_cp(image_path, completed)
+            mesh = run_stage(idx, total, mesh_label,
+                lambda: generate_mesh(nobg, OUTPUT_BASE / "mesh",
+                                      format=args.format, backend=args.backend,
+                                      texturer=args.texturer), logger)
+            completed.add("mesh"); save_cp(image_path, completed, backend=args.backend)
         final = mesh
 
     if "rig" in stages:
@@ -207,7 +222,7 @@ def run_pipeline(args, image_path, output_path, motion_path, logger):
         else:
             rigged = run_stage(idx, total, "자동 리깅",
                 lambda: auto_rig(mesh, OUTPUT_BASE / "rigged"), logger)
-            completed.add("rig"); save_cp(image_path, completed)
+            completed.add("rig"); save_cp(image_path, completed, backend=args.backend)
         final = rigged
 
     if "motion" in stages:
@@ -222,7 +237,7 @@ def run_pipeline(args, image_path, output_path, motion_path, logger):
                 lambda: apply_motion(rigged, str(motion_path),
                                      OUTPUT_BASE / "animated", motion_name=mname),
                 logger)
-            completed.add("motion"); save_cp(image_path, completed)
+            completed.add("motion"); save_cp(image_path, completed, backend=args.backend)
         final = anim
 
         if not args.no_preview:
@@ -325,6 +340,11 @@ def build_parser():
     p.add_argument("--mesh-only", action="store_true", help="메시 생성까지만 수행")
     p.add_argument("--rig-only", action="store_true", help="리깅까지만 수행 (모션 단계 건너뜀)")
     p.add_argument("--format", default="glb", choices=["glb", "obj"], help="메시 출력 포맷")
+    p.add_argument("--backend", default="triposr", choices=list(VALID_BACKENDS),
+                   help="3D 메시 생성 백엔드 (triposr=빠름·컬러, triposg=고품질·지오메트리)")
+    p.add_argument("--texturer", default="mvadapter", choices=list(VALID_TEXTURERS),
+                   help="텍스처 파이프라인 (triposg 백엔드 전용): "
+                        "none=텍스처 없음, ortho=직교 투영(빠름), hunyuan=Hunyuan3D-2 Paint(고품질)")
     p.add_argument("--keep-intermediate", action=argparse.BooleanOptionalAction,
                    default=True, help="중간 결과 파일 보존 (기본 True)")
     p.add_argument("--no-preview", action="store_true",
@@ -352,7 +372,8 @@ def main():
 
     logger, log_path = setup_logger()
     print(f"[log] {log_path}")
-    logger.info(f"Pipeline start | input={args.input} output={args.output} motion={args.motion}")
+    logger.info(f"Pipeline start | input={args.input} output={args.output} "
+                f"motion={args.motion} backend={args.backend}")
 
     motion_path = None
     if args.motion and not args.mesh_only and not args.rig_only:

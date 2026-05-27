@@ -74,14 +74,28 @@ def _setup_constraints(target_arm, source_arm, mapping):
 
     src_names = set(source_arm.pose.bones.keys())
     tgt_names = set(target_arm.pose.bones.keys())
+
+    # Mixamo BVHs come in two flavors: bones named plainly ("Hips", "Spine"
+    # ...) and bones with the FBX-style "mixamorig:" prefix ("mixamorig:Hips"
+    # ...). retarget_config.json uses plain names; resolve to whichever form
+    # the imported source skeleton actually uses so both flavors retarget.
+    def resolve_src(cfg_name):
+        if cfg_name in src_names:
+            return cfg_name
+        prefixed = f"mixamorig:{cfg_name}"
+        if prefixed in src_names:
+            return prefixed
+        return None
+
     matched = 0
     for src_name, tgt_name in mapping.items():
-        if src_name not in src_names or tgt_name not in tgt_names:
+        actual_src = resolve_src(src_name)
+        if actual_src is None or tgt_name not in tgt_names:
             continue
         bone = target_arm.pose.bones[tgt_name]
         c = bone.constraints.new("COPY_ROTATION")
         c.target = source_arm
-        c.subtarget = src_name
+        c.subtarget = actual_src
         c.target_space = "LOCAL"
         c.owner_space = "LOCAL"
         matched += 1

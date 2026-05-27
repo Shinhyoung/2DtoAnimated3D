@@ -10,8 +10,26 @@ output/
 verify_*
 dummy.*
 
-# External dependency (cloned by install_3d_model.sh)
+# External dependencies (cloned by install_3d_model.sh)
 TripoSR/
+TripoSG/
+Hunyuan3D-2/
+MV-Adapter/
+
+# Downloaded model weights
+checkpoints/
+
+# Backup files from local iterations (kept locally, not in VCS)
+*.bak.*
+
+# Scratch / diagnostic scripts (one-off, not part of the pipeline)
+_diag_*.py
+_recover_*.py
+_test_*.py
+
+# Sample input artifacts at repo root (not part of the pipeline)
+K.jpg
+gun.png
 
 # Python
 __pycache__/

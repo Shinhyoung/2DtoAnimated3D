@@ -55,6 +55,8 @@ def auto_rig(
     output_dir: Union[str, Path] = "./output/rigged",
     skeleton_type: str = "mixamo",
     config_path: Union[str, Path, None] = None,
+    voxel_size: float = 0.0065,
+    skip_voxel_remesh: bool = False,
 ) -> str:
     mesh_path = Path(mesh_path).resolve()
     if not mesh_path.is_file():
@@ -78,7 +80,10 @@ def auto_rig(
         "--output", str(out_path),
         "--config", str(config_path),
         "--skeleton-type", skeleton_type,
+        "--voxel-size", str(voxel_size),
     ]
+    if skip_voxel_remesh:
+        cmd.append("--skip-voxel-remesh")
     print(f"[auto_rig] blender: {blender}")
     print(f"[auto_rig] {mesh_path.name} -> {out_path}")
     res = subprocess.run(cmd, capture_output=True, text=True)
